@@ -1,86 +1,72 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.16)
 project(ros_omron_agv)
 
-find_package(catkin REQUIRED COMPONENTS
-  angles
-  actionlib
-  actionlib_msgs
-  libaria
-  move_base_msgs
-  nav_msgs
-	roscpp
-  sensor_msgs
-  std_msgs
-	std_srvs
-	tf
-	tf2
-	tf2_eigen
-  tf2_geometry_msgs
-	tf2_ros
-	message_generation
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+find_package(ament_cmake REQUIRED)
+find_package(action_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(libaria CONFIG REQUIRED)
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/Omron.msg"
+  "srv/DockRequest.srv"
 )
-
-find_package(Boost REQUIRED COMPONENTS thread)
-
-add_message_files(
-  FILES
-  Omron.msg
-)
-
-add_service_files(
-  FILES
-  DockRequest.srv
-)
-
-
-generate_messages(
-  DEPENDENCIES
-  std_msgs
-)
-
-
-catkin_package()
-
-###########
-## Build ##
-###########
-
-include_directories(
-  ${catkin_INCLUDE_DIRS}
-)
-
 
 add_executable(omron_laser_node src/laser_node.cpp)
-add_dependencies(omron_laser_node ros_omron_agv_generate_messages_cpp)
+ament_target_dependencies(omron_laser_node
+  rclcpp
+  sensor_msgs
+)
+target_link_libraries(omron_laser_node
+  libaria::ArNetworking
+)
 
 add_executable(robot_status_node src/robot_status.cpp)
-add_dependencies(robot_status_node ros_omron_agv_generate_messages_cpp)
+ament_target_dependencies(robot_status_node
+  action_msgs
+  geometry_msgs
+  rclcpp
+  tf2
+  tf2_geometry_msgs
+  tf2_ros
+)
+target_link_libraries(robot_status_node
+  libaria::ArNetworking
+)
 
 add_executable(map_node src/map_server.cpp)
-add_dependencies(map_node ros_omron_agv_generate_messages_cpp)
-
-target_link_libraries(omron_laser_node
-  ${catkin_LIBRARIES}
+ament_target_dependencies(map_node
+  nav_msgs
+  rclcpp
 )
-
-target_link_libraries(robot_status_node
-  ${catkin_LIBRARIES}
-)
-
 target_link_libraries(map_node
-  ${catkin_LIBRARIES}
+  libaria::ArNetworking
 )
 
-#############
-## Install ##
-#############
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} rosidl_typesupport_cpp)
+target_link_libraries(robot_status_node ${cpp_typesupport_target})
 
 install(TARGETS omron_laser_node robot_status_node map_node
-   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
-   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY launch rviz docs
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+  DESTINATION share/${PROJECT_NAME}
 )
+
+install(FILES README.md
+  DESTINATION share/${PROJECT_NAME}
+)
+
+ament_export_dependencies(rosidl_default_runtime)
+ament_package()

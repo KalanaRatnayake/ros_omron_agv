@@ -1,486 +1,382 @@
-//ROS OMRON driver
-//------------------
-
-#include <ros/ros.h>
 #include <Aria/Aria.h>
-#include <ArNetworking/ArNetworking.h>
 #include <ArNetworking/ArClientRatioDrive.h>
-#include <tf/transform_broadcaster.h>
-#include <angles/angles.h>
-#include <geometry_msgs/PoseStamped.h>
-#include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <ArNetworking/ArNetworking.h>
+
+#include <action_msgs/msg/goal_status.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <rclcpp/rclcpp.hpp>
 #include <tf2/LinearMath/Quaternion.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
-#include <move_base_msgs/MoveBaseAction.h>
-#include <actionlib/server/simple_action_server.h>
-#include <actionlib_msgs/GoalStatus.h>
-#include <ros_omron_agv/DockRequest.h>
-#include <ros_omron_agv/Omron.h>
-#include <std_srvs/Empty.h>
+#include <tf2/utils.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+
+#include <ros_omron_agv/msg/omron.hpp>
+#include <ros_omron_agv/srv/dock_request.hpp>
 
 #include <cmath>
+#include <cstring>
+#include <memory>
+#include <algorithm>
+#include <stdexcept>
+#include <string>
 
-class statusPub
+class OmronStatusNode : public rclcpp::Node
 {
 public:
-  //Constructor sets up the rostopic
-  statusPub(ArClientBase *client, ros::NodeHandle *nh, std::string name="Pose", std::string topic="/pose"); 
-  //The laser callback is called when data is sent from the robot and publishes to ROS
-  void pose_cb(ArNetPacket *packet);
-  void status_cb(ArNetPacket *packet);
-  void dock_stats_cb(ArNetPacket *packet);
-  void simplePoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg);
-  void LocaliseCallback(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& msg);
-  void moveExecteCB(const move_base_msgs::MoveBaseGoalConstPtr &goal);
+  OmronStatusNode()
+      : Node("robot_status_node"),
+        ratio_drive_(&client_),
+        update_numbers_callback_(this, &OmronStatusNode::handleUpdateNumbers),
+        update_strings_callback_(this, &OmronStatusNode::handleUpdateStrings),
+        dock_info_callback_(this, &OmronStatusNode::handleDockInfo)
+  {
+    host_ = declare_parameter<std::string>("host", "192.168.1.1");
+    port_ = declare_parameter<int>("port", 7272);
+    user_ = declare_parameter<std::string>("user", "admin");
+    password_ = declare_parameter<std::string>("password", "admin");
+    protocol_ = declare_parameter<std::string>("protocol", "6MTX");
+    map_frame_ = declare_parameter<std::string>("map_frame", "map");
+    base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
+    pose_topic_ = declare_parameter<std::string>("pose_topic", "current_pose");
+    status_topic_ = declare_parameter<std::string>("status_topic", "robot_status");
+    goal_topic_ = declare_parameter<std::string>("goal_topic", "goal_pose");
+    initial_pose_topic_ = declare_parameter<std::string>("initial_pose_topic", "initialpose");
+    cmd_vel_topic_ = declare_parameter<std::string>("cmd_vel_topic", "cmd_vel");
+    cmd_vel_timeout_sec_ = declare_parameter<double>("cmd_vel_timeout_sec", 0.2);
+    max_linear_speed_mps_ = declare_parameter<double>("max_linear_speed_mps", 0.5);
+    max_angular_speed_rad_s_ = declare_parameter<double>("max_angular_speed_rad_s", 1.0);
+    drive_throttle_pct_ = declare_parameter<double>("drive_throttle_pct", 100.0);
+    unsafe_drive_ = declare_parameter<bool>("unsafe_drive", true);
 
-  bool requestDock(ros_omron_agv::DockRequest::Request &req, ros_omron_agv::DockRequest::Response &res){
-    res.result = true;
-    myClient->requestOnce("dock");
-    return true;
-  } 
+    pose_publisher_ = create_publisher<geometry_msgs::msg::PoseStamped>(pose_topic_, 10);
+    status_publisher_ = create_publisher<ros_omron_agv::msg::Omron>(status_topic_, 10);
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
-  //Public robot stats
-  int robotMode = 0;
-  int robotStatus = 0;
-  int dock_status = 0;
+    goal_subscription_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+        goal_topic_, 10, std::bind(&OmronStatusNode::handleGoalPose, this, std::placeholders::_1));
+    initial_pose_subscription_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+        initial_pose_topic_, 10, std::bind(&OmronStatusNode::handleInitialPose, this, std::placeholders::_1));
+    cmd_vel_subscription_ = create_subscription<geometry_msgs::msg::Twist>(
+        cmd_vel_topic_, 10, std::bind(&OmronStatusNode::handleCmdVel, this, std::placeholders::_1));
 
-  geometry_msgs::PoseStamped currentPose;
+    dock_service_ = create_service<ros_omron_agv::srv::DockRequest>(
+        "dock", std::bind(&OmronStatusNode::handleDockRequest, this, std::placeholders::_1, std::placeholders::_2));
 
-protected:
+    watchdog_timer_ = create_wall_timer(
+        std::chrono::milliseconds(200), std::bind(&OmronStatusNode::handleCmdVelWatchdog, this));
 
-  ros::Publisher pose_pub, status_pub;
-  ArClientBase *myClient;
-  ros::NodeHandle *_nh;
-  ros::Subscriber sub_goal, sub_initpose;
+    connectClient();
+    configureHandlers();
+    ratio_drive_.setThrottle(drive_throttle_pct_);
+    configureDriveMode();
+    client_.runAsync();
 
-
-  //Don't understand the ArFunctors but this is how they do it
-  ArFunctor1C<statusPub, ArNetPacket *> myPoseCB;
-  ArFunctor1C<statusPub, ArNetPacket *> myStatusCB;
-  ArFunctor1C<statusPub, ArNetPacket *> dockedStatusCB;
-
-  int seq = 0;
-
-  //Action Server
-  actionlib::SimpleActionServer<move_base_msgs::MoveBaseAction> as_; //Make a simple move to pose action server
-
-  //feedback mesaages 
-  move_base_msgs::MoveBaseFeedback feedback_; 
-  move_base_msgs::MoveBaseResult result_;
-
-
-  //Dock server
-  ros::ServiceServer service;
-
-  //Define callbacks
-  void cmdVelCB(const geometry_msgs::Twist::ConstPtr& msg);
-  void cmdVelWD(const ros::TimerEvent&);
-
-
-  //Cmd Vel variables
-  ros::Timer timer;
-  ros::Subscriber cmdVelSub;
-  uint8_t velCount;
-  uint8_t prevVelCount;
-  bool vel_valid;
-
-};
-
-//Setup setup callbac stuff
-statusPub::statusPub(ArClientBase *client, ros::NodeHandle *nh, std::string name, std::string topic) : 
-      myClient(client), _nh(nh), 
-      myPoseCB(this, &statusPub::pose_cb), dockedStatusCB(this, &statusPub::dock_stats_cb),
-      myStatusCB(this, &statusPub::status_cb),
-      as_(*_nh, "move_base",  boost::bind(&statusPub::moveExecteCB, this, _1), false)
-{
-  //Setup simple status publisher
-  //TODO  
-
-  //Setup Callback for simple goal & localisation
-  sub_goal = _nh->subscribe("/move_base_simple/goal", 10, &statusPub::simplePoseCallback, this);
-  sub_initpose = _nh->subscribe("/initialpose", 10, &statusPub::LocaliseCallback, this);
-  ros::spinOnce;     
-
-  myClient->addHandler("updateNumbers", &myPoseCB);
-  myClient->request("updateNumbers", 50); //Seems if we request rate of 50 we get 10hz max
-
-  myClient->addHandler("updateStrings", &myStatusCB);
-  myClient->request("updateStrings", -1); //request when changed
-
-  myClient->addHandler("dockInfoChanged", &dockedStatusCB);
-  myClient->requestOnce("dockInfoChanged");
-  myClient->request("dockInfoChanged", -1);
-
-  ROS_INFO("Setup Callback for %s publishing on %s",name.c_str(), topic.c_str());
-
-  //Create the action server
-  as_.start();
-
-  //Setup 
-  service = _nh->advertiseService("dock", &statusPub::requestDock, this);
-
-  //Advertise Publisher
-  status_pub = _nh->advertise<ros_omron_agv::Omron>("robot_status", 100);
-
-  //Cmd vel
-  cmdVelSub = _nh->subscribe("cmd_vel", 10, &statusPub::cmdVelCB, this); //register callback
-  timer=_nh->createTimer(ros::Duration(0.2), &statusPub::cmdVelWD, this);
-  velCount = 0;
-  prevVelCount = 0;
-  vel_valid = false;
-}
-
-void statusPub::pose_cb(ArNetPacket *packet)
-{
-  double batVolt, x , y, theta, x_vel, y_vel, theta_vel, temp;
-
-  batVolt = ( (double) packet->bufToByte2() )/10.0;
-  x = (double) packet->bufToByte4();
-  y = (double) packet->bufToByte4();
-  theta = (double) packet->bufToByte2();
-  x_vel = (double) packet->bufToByte2();
-  theta_vel = (double) packet->bufToByte2();
-  y_vel = (double) packet->bufToByte2();
-  temp = (double) packet->bufToByte();
-
-  static tf::TransformBroadcaster br; 
-  tf::Transform transform;
-  transform.setOrigin( tf::Vector3(x/1000.0, y/1000.0, 0.0) );
-  tf::Quaternion q;
-  q.setRPY(0, 0, angles::from_degrees(theta/1.0)); //TODO this is bit shit there is better numbers around
-  transform.setRotation(q);
-  br.sendTransform(tf::StampedTransform(transform, ros::Time::now(), "map", "base_link"));
-
-  currentPose.header.frame_id = "base_link";
-  currentPose.header.stamp = ros::Time::now();
-  currentPose.pose.orientation.x = q.getX();
-  currentPose.pose.orientation.y = q.getY();
-  currentPose.pose.orientation.z = q.getZ();
-  currentPose.pose.orientation.w = q.getW();
-  currentPose.pose.position.x = x/1000.0;
-  currentPose.pose.position.y = y/1000.0;
-  currentPose.pose.position.z = 0;
-
-  ros_omron_agv::Omron data;
-  data.batteryPercentage = batVolt;
-  data.dockStatus = dock_status;
-  data.robotStatus = robotStatus;
-  //publish the status data
-  status_pub.publish(data);
-}
-
-void statusPub::status_cb(ArNetPacket *packet)
-{
-  char myStatus[256];
-  char myMode[256];
-  memset(myStatus, 0, sizeof(myStatus));
-  memset(myMode, 0, sizeof(myMode));
-  packet->bufToStr(myStatus, sizeof(myStatus));
-  packet->bufToStr(myMode, sizeof(myMode));
-
-
-  //Lets fill status using ActionLib Msgs - Goal Status
-  char * pch;
-  pch = strstr(myStatus, "Parking");  //When it is in an idle state the robot retruns parking
-  if (pch != NULL){
-    robotStatus = actionlib_msgs::GoalStatus::PENDING;
-  }
-  pch = strstr(myStatus, "Undocking");  //Undocking to move to the goal
-  if (pch != NULL){
-    robotStatus = actionlib_msgs::GoalStatus::ACTIVE;
-  }
-  pch = strstr(myStatus, "Going"); //Moving to goal
-  if (pch != NULL){
-    robotStatus = actionlib_msgs::GoalStatus::ACTIVE;
-  }
-  pch = strstr(myStatus, "Arrived"); //Got to goal
-  if (pch != NULL){
-    robotStatus = actionlib_msgs::GoalStatus::SUCCEEDED;
-  }
-  pch = strstr(myStatus, "Failed: Failed going to goal"); //Couldn't make it e.g. path blocked
-  if (pch != NULL){
-    robotStatus = actionlib_msgs::GoalStatus::ABORTED;
-  }
-  pch = strstr(myStatus, "Failed: Cannot find path"); //Couldnt find valid plan
-  if (pch != NULL){
-    robotStatus = actionlib_msgs::GoalStatus::REJECTED;
+    RCLCPP_INFO(
+        get_logger(), "Connected to %s:%d using protocol %s", host_.c_str(), port_,
+        protocol_.empty() ? "server-advertised" : protocol_.c_str());
   }
 
-  //ROS_INFO("Status %10s, code %d", myStatus, robotStatus);
+  ~OmronStatusNode() override
+  {
+    client_.disconnect();
+    Aria::shutdown();
+  }
 
-}
+private:
+  void connectClient()
+  {
+    Aria::init();
+    ArLog::init(ArLog::StdOut, ArLog::Normal);
 
-void statusPub::dock_stats_cb(ArNetPacket *packet)
-{
-  int state = packet->bufToUByte();
-  int forcedDock = packet->bufToUByte();
-  int secondsToShutdown = packet->bufToUByte2();
-
-  std::string stateStr;
-  std::string forcedStr;
-
-  if (state == 0)
-    stateStr = "  Undocked";
-  else if (state == 1)
-    stateStr = "   Docking";
-  else if (state == 2)
-    stateStr = "   Docked";
-  else if (state == 3)
-    stateStr = "Undocking";
-  else
-    stateStr = "  Unknown";
-  
-  if (forcedDock == 0)
-    forcedStr = "false";
-  else if (forcedDock == 1)
-    forcedStr = " true";
-  else
-    forcedStr = "unknown";
-
-  //Store it
-  this->dock_status = state;
-
-  if (secondsToShutdown == 0)
-    ROS_INFO("State: %s Forced: %s Shutdown: never", 
-	       stateStr.c_str(), forcedStr.c_str());
-  else
-    ROS_INFO( "State: %s Forced: %s Shutdown: %d", 
-	       stateStr.c_str(), forcedStr.c_str(), secondsToShutdown);
-  
-}
-
-void statusPub::simplePoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
-{
-  //<td>gotoPose</td> <td> X (4-byte integer), Y (4-byte int), Theta (optional 2-byte int)</td>
-
-  int x = msg->pose.position.x*1000;
-  int y = msg->pose.position.y*1000;
-
-  tf2::Quaternion orientation;
-  tf2::fromMsg(msg->pose.orientation,orientation);
-
-  double roll, pitch, yaw;
-  tf2::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
-
-  int theta = angles::to_degrees(yaw);
-
-  ROS_INFO("I got a pose at (%d, %d) Theta: %d", x, y, theta);
-
-  ArNetPacket p;
-  p.byte4ToBuf(x); //X
-  p.byte4ToBuf(y); //Y
-  p.byte4ToBuf(theta); //Theta
-  myClient->requestOnce("gotoPose", &p);
-
-}
-
-void statusPub::LocaliseCallback(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& msg)
-{
-  //<td>gotoPose</td> <td> X (4-byte integer), Y (4-byte int), Theta (4-byte int)</td>
-
-  int x = msg->pose.pose.position.x*1000;
-  int y = msg->pose.pose.position.y*1000;
-
-  tf2::Quaternion orientation;
-  tf2::fromMsg(msg->pose.pose.orientation,orientation);
-
-  double roll, pitch, yaw;
-  tf2::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
-
-  int theta = angles::to_degrees(yaw);
-
-  ROS_INFO("Set pose to (%d, %d) Theta: %d", x, y, theta);
-
-  ArNetPacket p;
-  p.byte4ToBuf(x); //X
-  p.byte4ToBuf(y); //Y
-  p.byte4ToBuf(theta); //ThetaI got a pose at
-  myClient->requestOnce("localizeToPose", &p);
-
-}
-
-void statusPub::moveExecteCB(const move_base_msgs::MoveBaseGoalConstPtr &goal){
-  //TODO
-  //<td>gotoPose</td> <td> X (4-byte integer), Y (4-byte int), Theta (optional 2-byte int)</td>
-
-  int x = goal->target_pose.pose.position.x*1000;
-  int y = goal->target_pose.pose.position.y*1000;
-
-  tf2::Quaternion orientation;
-  tf2::fromMsg(goal->target_pose.pose.orientation,orientation);
-
-  double roll, pitch, yaw;
-  tf2::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
-
-  int theta = angles::to_degrees(yaw);
-
-  ROS_INFO("I got a pose at (%d, %d) Theta: %d", x, y, theta);
-
-  ArNetPacket p;
-  p.byte4ToBuf(x); //X
-  p.byte4ToBuf(y); //Y
-  p.byte4ToBuf(theta); //Theta
-  myClient->requestOnce("gotoPose", &p);
-
-  ros::Duration(0.5).sleep(); //Takes some time to switch states on robot
-
-  //Provide feedback at 10hz
-  ros::Rate r(10);
-
-  bool running = true;
-  bool success = true;
-  while (running){
-    
-    //Check if pre-empted
-    if (as_.isPreemptRequested() || !ros::ok()){
-        ROS_INFO("%s: Preempted", "Move Base");
-        // set the action state to preempted
-        as_.setPreempted();
-        success = false;
-        running = false;
-
-        //stop robot
-        myClient->requestOnce("stop", NULL);
+    if (!protocol_.empty())
+    {
+      client_.enforceProtocolVersion(protocol_.c_str());
     }
 
-    //Check if active 
-    if (robotStatus == actionlib_msgs::GoalStatus::ACTIVE){
-        ROS_INFO("%s: Moving to Goal", "Move Base");
-    }
-    if (robotStatus == actionlib_msgs::GoalStatus::SUCCEEDED){
-        ROS_INFO("%s: Got to Goal", "Move Base");
-        running = false;
-        success = true;
-        as_.setSucceeded(result_);
-    }
-    if (robotStatus == actionlib_msgs::GoalStatus::ABORTED || robotStatus == actionlib_msgs::GoalStatus::REJECTED){
-        ROS_INFO("%s: Failed getting to Goal", "Move Base");
-        running = false;
-        success = false;
-        as_.setAborted(result_);
+    const char *password = password_.empty() ? NULL : password_.c_str();
+    if (!client_.blockingConnect(host_.c_str(), port_, true, user_.c_str(), password))
+    {
+      if (client_.wasRejected())
+      {
+        throw std::runtime_error("Robot rejected the connection credentials or protocol.");
+      }
+      throw std::runtime_error("Could not connect to the Omron robot server.");
     }
 
-    feedback_.base_position = currentPose;
-    as_.publishFeedback(feedback_);
-
-    r.sleep();
+    client_.setRobotName(host_.c_str());
   }
-    
 
+  void configureHandlers()
+  {
+    if (client_.dataExists("updateNumbers"))
+    {
+      client_.addHandler("updateNumbers", &update_numbers_callback_);
+      client_.request("updateNumbers", 50);
+    }
+    if (client_.dataExists("updateStrings"))
+    {
+      client_.addHandler("updateStrings", &update_strings_callback_);
+      client_.request("updateStrings", -1);
+    }
+    if (client_.dataExists("dockInfoChanged"))
+    {
+      client_.addHandler("dockInfoChanged", &dock_info_callback_);
+      client_.requestOnce("dockInfoChanged");
+      client_.request("dockInfoChanged", -1);
+    }
+  }
 
-}
+  void configureDriveMode()
+  {
+    if (!client_.dataExists("setSafeDrive"))
+    {
+      RCLCPP_WARN(get_logger(), "Server does not advertise setSafeDrive; leaving drive mode unchanged");
+      return;
+    }
 
-void statusPub::cmdVelCB(const geometry_msgs::Twist::ConstPtr& msg){
-  velCount++;
-  if (fabs(msg->linear.x) > 0.001 || fabs(msg->angular.z) > 0.001){
+    if (unsafe_drive_)
+    {
+      ratio_drive_.unsafeDrive();
+      RCLCPP_WARN(get_logger(), "Unsafe drive enabled for teleop");
+    }
+    else
+    {
+      ratio_drive_.safeDrive();
+      RCLCPP_INFO(get_logger(), "Safe drive enabled for teleop");
+    }
+  }
+
+  void handleUpdateNumbers(ArNetPacket *packet)
+  {
+    const double battery_voltage = static_cast<double>(packet->bufToByte2()) / 10.0;
+    const double x = static_cast<double>(packet->bufToByte4()) / 1000.0;
+    const double y = static_cast<double>(packet->bufToByte4()) / 1000.0;
+    const double theta_deg = static_cast<double>(packet->bufToByte2());
+    packet->bufToByte2();
+    packet->bufToByte2();
+    packet->bufToByte2();
+    packet->bufToByte();
+
+    tf2::Quaternion orientation;
+    orientation.setRPY(0.0, 0.0, theta_deg * M_PI / 180.0);
+
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.stamp = now();
+    transform.header.frame_id = map_frame_;
+    transform.child_frame_id = base_frame_;
+    transform.transform.translation.x = x;
+    transform.transform.translation.y = y;
+    transform.transform.translation.z = 0.0;
+    transform.transform.rotation = tf2::toMsg(orientation);
+    tf_broadcaster_->sendTransform(transform);
+
+    current_pose_.header = transform.header;
+    current_pose_.pose.position.x = x;
+    current_pose_.pose.position.y = y;
+    current_pose_.pose.position.z = 0.0;
+    current_pose_.pose.orientation = transform.transform.rotation;
+    pose_publisher_->publish(current_pose_);
+
+    ros_omron_agv::msg::Omron status;
+    status.battery_percentage = static_cast<std::uint8_t>(std::round(battery_voltage));
+    status.dock_status = static_cast<std::uint8_t>(dock_status_);
+    status.robot_status = static_cast<std::uint8_t>(robot_status_);
+    status_publisher_->publish(status);
+  }
+
+  void handleUpdateStrings(ArNetPacket *packet)
+  {
+    char status_buffer[256];
+    char mode_buffer[256];
+    std::memset(status_buffer, 0, sizeof(status_buffer));
+    std::memset(mode_buffer, 0, sizeof(mode_buffer));
+    packet->bufToStr(status_buffer, sizeof(status_buffer));
+    packet->bufToStr(mode_buffer, sizeof(mode_buffer));
+
+    const std::string status = status_buffer;
+    if (status.find("Parking") != std::string::npos)
+    {
+      robot_status_ = action_msgs::msg::GoalStatus::STATUS_ACCEPTED;
+    }
+    if (status.find("Undocking") != std::string::npos || status.find("Going") != std::string::npos)
+    {
+      robot_status_ = action_msgs::msg::GoalStatus::STATUS_EXECUTING;
+    }
+    if (status.find("Arrived") != std::string::npos)
+    {
+      robot_status_ = action_msgs::msg::GoalStatus::STATUS_SUCCEEDED;
+    }
+    if (status.find("Failed: Failed going to goal") != std::string::npos)
+    {
+      robot_status_ = action_msgs::msg::GoalStatus::STATUS_ABORTED;
+    }
+    if (status.find("Failed: Cannot find path") != std::string::npos)
+    {
+      robot_status_ = action_msgs::msg::GoalStatus::STATUS_CANCELED;
+    }
+  }
+
+  void handleDockInfo(ArNetPacket *packet)
+  {
+    dock_status_ = packet->bufToUByte();
+    packet->bufToUByte();
+    packet->bufToUByte2();
+  }
+
+  void handleGoalPose(const geometry_msgs::msg::PoseStamped::SharedPtr message)
+  {
+    sendPoseRequest("gotoPose", message->pose.position.x, message->pose.position.y, tf2::getYaw(message->pose.orientation));
+  }
+
+  void handleInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr message)
+  {
+    sendPoseRequest(
+        "localizeToPose", message->pose.pose.position.x, message->pose.pose.position.y,
+        tf2::getYaw(message->pose.pose.orientation));
+  }
+
+  void sendPoseRequest(const char *request_name, double x_meters, double y_meters, double yaw_radians)
+  {
+    if (!client_.dataExists(request_name))
+    {
+      RCLCPP_WARN(get_logger(), "Server does not advertise %s", request_name);
+      return;
+    }
+
     ArNetPacket packet;
-    vel_valid = true;
-    packet.doubleToBuf(msg->linear.x);
-    packet.doubleToBuf(msg->angular.z);
-    packet.doubleToBuf(100); // this is an additional amount (percentage) that is applied to each of the trans,rot,lat velocities. 
-    packet.doubleToBuf(0.0);
-  //  if (myPrinting) printf("ArClientRatioDrive: Sending ratioDrive request\n");
-    myClient->requestOnce("ratioDrive", &packet);
-  }
-  else {
-    vel_valid = false;
+    packet.byte4ToBuf(static_cast<int>(std::lround(x_meters * 1000.0)));
+    packet.byte4ToBuf(static_cast<int>(std::lround(y_meters * 1000.0)));
+    packet.byte4ToBuf(static_cast<int>(std::lround(yaw_radians * 180.0 / M_PI)));
+    client_.requestOnce(request_name, &packet);
   }
 
-}
-
-void statusPub::cmdVelWD(const ros::TimerEvent&){
-    if ((uint8_t)(velCount - prevVelCount) > 0){
-      //Valid data
-      prevVelCount = velCount;
+  void handleCmdVel(const geometry_msgs::msg::Twist::SharedPtr message)
+  {
+    last_cmd_vel_time_ = now();
+    stop_sent_ = false;
+    cmd_vel_active_ = std::fabs(message->linear.x) > 1e-3 || std::fabs(message->angular.z) > 1e-3;
+    if (!cmd_vel_active_)
+    {
+      ratio_drive_.stop();
+      return;
     }
-    else if (vel_valid == true){
-      vel_valid = false;
-      myClient->requestOnce("stop");
-      ROS_WARN("Timeout on cmd_vel. velCount: %d, prevVelCount: %d", velCount, prevVelCount);
-    }
-}
 
+    if (!client_.dataExists("ratioDrive"))
+    {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Server does not advertise ratioDrive");
+      return;
+    }
+
+    const double trans_ratio = toPercent(message->linear.x, max_linear_speed_mps_);
+    const double rot_ratio = toPercent(message->angular.z, max_angular_speed_rad_s_);
+
+    ratio_drive_.setThrottle(drive_throttle_pct_);
+    ratio_drive_.setLatVelRatio(0.0);
+    ratio_drive_.setTransVelRatio(trans_ratio);
+    ratio_drive_.setRotVelRatio(rot_ratio);
+  }
+
+  void handleCmdVelWatchdog()
+  {
+    if (!cmd_vel_active_)
+    {
+      return;
+    }
+
+    if ((now() - last_cmd_vel_time_).seconds() > cmd_vel_timeout_sec_)
+    {
+      cmd_vel_active_ = false;
+      if (!stop_sent_)
+      {
+        ratio_drive_.stop();
+        stop_sent_ = true;
+        RCLCPP_WARN(get_logger(), "cmd_vel timeout; stop requested");
+      }
+    }
+  }
+
+  double toPercent(double value, double max_abs_value) const
+  {
+    if (max_abs_value <= 0.0)
+    {
+      return 0.0;
+    }
+
+    const double percent = (value / max_abs_value) * 100.0;
+    return std::clamp(percent, -100.0, 100.0);
+  }
+
+  void handleDockRequest(
+      const std::shared_ptr<ros_omron_agv::srv::DockRequest::Request>,
+      std::shared_ptr<ros_omron_agv::srv::DockRequest::Response> response)
+  {
+    response->result = false;
+    if (!client_.dataExists("dock"))
+    {
+      RCLCPP_WARN(get_logger(), "Server does not advertise dock");
+      return;
+    }
+    client_.requestOnce("dock");
+    response->result = true;
+  }
+
+  ArClientBase client_;
+  std::string host_;
+  int port_ = 7272;
+  std::string user_;
+  std::string password_;
+  std::string protocol_;
+  std::string map_frame_;
+  std::string base_frame_;
+  std::string pose_topic_;
+  std::string status_topic_;
+  std::string goal_topic_;
+  std::string initial_pose_topic_;
+  std::string cmd_vel_topic_;
+  double cmd_vel_timeout_sec_ = 0.2;
+  double max_linear_speed_mps_ = 0.5;
+  double max_angular_speed_rad_s_ = 1.0;
+  double drive_throttle_pct_ = 100.0;
+  bool unsafe_drive_ = true;
+  int robot_status_ = action_msgs::msg::GoalStatus::STATUS_UNKNOWN;
+  int dock_status_ = ros_omron_agv::msg::Omron::UNDOCKED;
+  bool cmd_vel_active_ = false;
+  bool stop_sent_ = false;
+  rclcpp::Time last_cmd_vel_time_{0, 0, RCL_ROS_TIME};
+  ArClientRatioDrive ratio_drive_;
+  geometry_msgs::msg::PoseStamped current_pose_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_publisher_;
+  rclcpp::Publisher<ros_omron_agv::msg::Omron>::SharedPtr status_publisher_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_subscription_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_subscription_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_subscription_;
+  rclcpp::Service<ros_omron_agv::srv::DockRequest>::SharedPtr dock_service_;
+  rclcpp::TimerBase::SharedPtr watchdog_timer_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  ArFunctor1C<OmronStatusNode, ArNetPacket *> update_numbers_callback_;
+  ArFunctor1C<OmronStatusNode, ArNetPacket *> update_strings_callback_;
+  ArFunctor1C<OmronStatusNode, ArNetPacket *> dock_info_callback_;
+};
 
 int main(int argc, char **argv)
 {
-  //Init ROS    
-  ros::init(argc, argv, "omron");
+  rclcpp::init(argc, argv);
 
-  //make node handle  
-  ros::NodeHandle n, np("~");
-
-  //Aria
-  Aria::init();
-  
-  //Create our client object. 
-  ArClientBase client;
-
-  //Set the magical protocol 
-  client.enforceProtocolVersion("5MTX");
-
-  //Settings
-  ArArgumentBuilder args;
-  //--------  
-  //HOST
-  args.addPlain("-host");
-  std::string sparam;
-  if (np.getParam("host", sparam))
+  try
   {
-    args.addPlain(sparam.c_str());
+    auto node = std::make_shared<OmronStatusNode>();
+    rclcpp::spin(node);
   }
-  else
+  catch (const std::exception &error)
   {
-    args.addPlain("172.19.21.203");  //Default IP
-  }
-  
-  //PORT
-  args.addPlain("-p");
-  if (np.getParam("port", sparam))
-  {
-    args.addPlain(sparam.c_str());
-  }
-  else
-  {
-    args.addPlain("7272");  //Default PORT
+    RCLCPP_FATAL(rclcpp::get_logger("robot_status_node"), "%s", error.what());
+    rclcpp::shutdown();
+    return 1;
   }
 
-  //USER
-  args.addPlain("-u");
-  if (np.getParam("user", sparam))
-  {
-    args.addPlain(sparam.c_str());
-  }
-  else
-  {
-    args.addPlain("steve");  //Default user
-  }
-  //NO PASSWD
-  args.addPlain("-np");
-
-  ArClientSimpleConnector clientConnector(&args);
-
-  //Reard in args
-  clientConnector.parseArgs();
-
-  //Connect
-  if (!clientConnector.connectClient(&client))
-  {
-    if (client.wasRejected())
-      ROS_ERROR("Server '%s' rejected connection, exiting\n", client.getHost());
-    else
-      ROS_ERROR("Could not connect to server '%s', exiting\n", client.getHost());
-    exit(1);
-  } 
-
-  ROS_INFO("Connected to server.\n");
-
-  //Setup the status pub object
-  statusPub pub(&client, &n);
-
-  client.runAsync();
-
-  ros::spin();  
-
-  client.disconnect();
-  Aria::exit(0);
+  rclcpp::shutdown();
+  return 0;
 }
