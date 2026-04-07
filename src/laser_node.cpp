@@ -6,17 +6,33 @@
 #include <sensor_msgs/msg/point_field.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+
+namespace
+{
+  void configureAriaDirectory()
+  {
+    if (std::getenv("ARIA") != nullptr)
+    {
+      return;
+    }
+
+#ifdef ROS_OMRON_ARIA_DIR
+    ::setenv("ARIA", ROS_OMRON_ARIA_DIR, 0);
+#endif
+  }
+}
 
 class OmronLaserNode : public rclcpp::Node
 {
 public:
   OmronLaserNode()
-  : Node("omron_laser_node"),
-    primary_callback_(this, &OmronLaserNode::handlePrimaryLaser),
-    secondary_callback_(this, &OmronLaserNode::handleSecondaryLaser)
+      : Node("omron_laser_node"),
+        primary_callback_(this, &OmronLaserNode::handlePrimaryLaser),
+        secondary_callback_(this, &OmronLaserNode::handleSecondaryLaser)
   {
     host_ = declare_parameter<std::string>("host", "172.19.21.203");
     port_ = declare_parameter<int>("port", 7272);
@@ -39,8 +55,8 @@ public:
     client_.runAsync();
 
     RCLCPP_INFO(
-      get_logger(), "Connected to %s:%d using protocol %s", host_.c_str(), port_,
-      protocol_.empty() ? "server-advertised" : protocol_.c_str());
+        get_logger(), "Connected to %s:%d using protocol %s", host_.c_str(), port_,
+        protocol_.empty() ? "server-advertised" : protocol_.c_str());
   }
 
   ~OmronLaserNode() override
@@ -52,6 +68,7 @@ public:
 private:
   void connectClient()
   {
+    configureAriaDirectory();
     Aria::init();
     ArLog::init(ArLog::StdOut, ArLog::Normal);
 
@@ -97,8 +114,8 @@ private:
   }
 
   void publishPointCloud(
-    ArNetPacket *packet,
-    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &publisher)
+      ArNetPacket *packet,
+      const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &publisher)
   {
     sensor_msgs::msg::PointCloud2 scan;
     scan.header.stamp = now();

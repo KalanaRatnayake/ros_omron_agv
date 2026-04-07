@@ -8,11 +8,27 @@
 #include <rclcpp/qos.hpp>
 
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace
+{
+void configureAriaDirectory()
+{
+  if (std::getenv("ARIA") != nullptr)
+  {
+    return;
+  }
+
+#ifdef ROS_OMRON_ARIA_DIR
+  ::setenv("ARIA", ROS_OMRON_ARIA_DIR, 0);
+#endif
+}
+}
 
 class OmronMapNode : public rclcpp::Node
 {
@@ -63,6 +79,7 @@ public:
 private:
   void connectClient()
   {
+    configureAriaDirectory();
     Aria::init();
     ArLog::init(ArLog::StdOut, ArLog::Normal);
 

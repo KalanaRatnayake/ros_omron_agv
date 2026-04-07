@@ -20,8 +20,24 @@
 #include <cstring>
 #include <memory>
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+
+namespace
+{
+void configureAriaDirectory()
+{
+  if (std::getenv("ARIA") != nullptr)
+  {
+    return;
+  }
+
+#ifdef ROS_OMRON_ARIA_DIR
+  ::setenv("ARIA", ROS_OMRON_ARIA_DIR, 0);
+#endif
+}
+}
 
 class OmronStatusNode : public rclcpp::Node
 {
@@ -88,6 +104,7 @@ public:
 private:
   void connectClient()
   {
+    configureAriaDirectory();
     Aria::init();
     ArLog::init(ArLog::StdOut, ArLog::Normal);
 
@@ -155,10 +172,14 @@ private:
     const double x = static_cast<double>(packet->bufToByte4()) / 1000.0;
     const double y = static_cast<double>(packet->bufToByte4()) / 1000.0;
     const double theta_deg = static_cast<double>(packet->bufToByte2());
-    packet->bufToByte2();
-    packet->bufToByte2();
-    packet->bufToByte2();
+    const double x_vel_mm_s = static_cast<double>(packet->bufToByte2());
+    const double theta_vel_deg_s = static_cast<double>(packet->bufToByte2());
+    const double y_vel_mm_s = static_cast<double>(packet->bufToByte2());
     packet->bufToByte();
+
+    feedback_trans_mps_ = x_vel_mm_s / 1000.0;
+    feedback_lat_mps_ = y_vel_mm_s / 1000.0;
+    feedback_rot_deg_s_ = theta_vel_deg_s;
 
     tf2::Quaternion orientation;
     orientation.setRPY(0.0, 0.0, theta_deg * M_PI / 180.0);
@@ -185,6 +206,15 @@ private:
     status.dock_status = static_cast<std::uint8_t>(dock_status_);
     status.robot_status = static_cast<std::uint8_t>(robot_status_);
     status_publisher_->publish(status);
+
+    if (cmd_vel_active_)
+    {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 500,
+        "teleop req linear=%.2f m/s angular=%.2f rad/s -> trans=%.1f%% rot=%.1f%% | feedback trans=%.2f m/s lat=%.2f m/s rot=%.1f deg/s",
+        last_cmd_linear_mps_, last_cmd_angular_rad_s_, last_cmd_trans_ratio_, last_cmd_rot_ratio_,
+        feedback_trans_mps_, feedback_lat_mps_, feedback_rot_deg_s_);
+    }
   }
 
   void handleUpdateStrings(ArNetPacket *packet)
@@ -273,6 +303,11 @@ private:
     const double trans_ratio = toPercent(message->linear.x, max_linear_speed_mps_);
     const double rot_ratio = toPercent(message->angular.z, max_angular_speed_rad_s_);
 
+    last_cmd_linear_mps_ = message->linear.x;
+    last_cmd_angular_rad_s_ = message->angular.z;
+    last_cmd_trans_ratio_ = trans_ratio;
+    last_cmd_rot_ratio_ = rot_ratio;
+
     ratio_drive_.setThrottle(drive_throttle_pct_);
     ratio_drive_.setLatVelRatio(0.0);
     ratio_drive_.setTransVelRatio(trans_ratio);
@@ -345,6 +380,13 @@ private:
   int dock_status_ = ros_omron_agv::msg::Omron::UNDOCKED;
   bool cmd_vel_active_ = false;
   bool stop_sent_ = false;
+  double last_cmd_linear_mps_ = 0.0;
+  double last_cmd_angular_rad_s_ = 0.0;
+  double last_cmd_trans_ratio_ = 0.0;
+  double last_cmd_rot_ratio_ = 0.0;
+  double feedback_trans_mps_ = 0.0;
+  double feedback_lat_mps_ = 0.0;
+  double feedback_rot_deg_s_ = 0.0;
   rclcpp::Time last_cmd_vel_time_{0, 0, RCL_ROS_TIME};
   ArClientRatioDrive ratio_drive_;
   geometry_msgs::msg::PoseStamped current_pose_;

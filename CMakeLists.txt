@@ -17,12 +17,15 @@ find_package(tf2_ros REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(libaria CONFIG REQUIRED)
 
+set(ROS_OMRON_ARIA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libaria")
+
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Omron.msg"
   "srv/DockRequest.srv"
 )
 
 add_executable(omron_laser_node src/laser_node.cpp)
+target_compile_definitions(omron_laser_node PRIVATE ROS_OMRON_ARIA_DIR="${ROS_OMRON_ARIA_DIR}")
 ament_target_dependencies(omron_laser_node
   rclcpp
   sensor_msgs
@@ -32,6 +35,7 @@ target_link_libraries(omron_laser_node
 )
 
 add_executable(robot_status_node src/robot_status.cpp)
+target_compile_definitions(robot_status_node PRIVATE ROS_OMRON_ARIA_DIR="${ROS_OMRON_ARIA_DIR}")
 ament_target_dependencies(robot_status_node
   action_msgs
   geometry_msgs
@@ -45,6 +49,7 @@ target_link_libraries(robot_status_node
 )
 
 add_executable(map_node src/map_server.cpp)
+target_compile_definitions(map_node PRIVATE ROS_OMRON_ARIA_DIR="${ROS_OMRON_ARIA_DIR}")
 ament_target_dependencies(map_node
   nav_msgs
   rclcpp

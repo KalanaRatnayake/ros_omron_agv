@@ -7,6 +7,14 @@ laser, robot status, and map nodes built on top of `libaria`.
 This does not replace Mobile Planner. Mobile Planner is still used for map
 creation and robot configuration.
 
+## Additional Documentation
+
+- [Protocol Detection And Interface Inspection](docs/protocol_detection.md)
+- [cmd_vel Interface](docs/cmd_vel.md)
+- [Laser Data And LaserScan Conversion](docs/laser_scan.md)
+- [Using libaria In Other Projects](docs/libaria.md)
+- [Example libaria Consumer Package](../examples/libaria_consumer_example/README.md)
+
 ## Migration Status
 
 Currently ported to ROS 2:
@@ -81,6 +89,61 @@ ros2 launch ros_omron_agv omron_bringup.launch.py \
 
 The launch file starts `omron_laser_node`, `robot_status_node`, and `map_node`.
 
+## Known-Good Bringup Commands
+
+These are the current working commands for the robot at `192.168.1.1` using
+`admin/admin` and protocol `6MTX`.
+
+Build and source:
+
+```bash
+cd /home/ubuntu/colcon_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select libaria ros_omron_agv
+source install/setup.bash
+```
+
+Check the raw interface first:
+
+```bash
+./install/libaria/bin/omron_robot_cli \
+	-host 192.168.1.1 \
+	-p 7272 \
+	-u admin \
+	-pw admin \
+	-protocol 6MTX \
+	--check-interface
+```
+
+Launch the ROS 2 nodes:
+
+```bash
+ros2 launch ros_omron_agv omron_bringup.launch.py \
+	host:=192.168.1.1 \
+	port:=7272 \
+	user:=admin \
+	password:=admin \
+	protocol:=6MTX \
+	unsafe_drive:=true
+```
+
+In a second terminal, run keyboard teleop:
+
+```bash
+cd /home/ubuntu/colcon_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
+Optional quick topic checks:
+
+```bash
+ros2 topic echo /robot_status --once
+ros2 topic echo /current_pose --once
+ros2 topic echo /map_metadata --once
+```
+
 ## Parameters
 
 - `host`: robot IP or hostname
@@ -91,10 +154,14 @@ The launch file starts `omron_laser_node`, `robot_status_node`, and `map_node`.
 - `laser_frame_id`: frame id for published point clouds
 - `map_frame`: frame id for map publication and the map side of the robot transform
 - `base_frame`: child frame id for the robot transform
-- `max_linear_speed_mps`: linear speed that maps to `100%` ratioDrive, default `0.5`
-- `max_angular_speed_rad_s`: angular speed that maps to `100%` ratioDrive, default `1.0`
+- `max_linear_speed_mps`: linear speed that maps to `100%` ratioDrive, default `1.2`
+- `max_angular_speed_rad_s`: angular speed that maps to `100%` ratioDrive, default `1.5`
 - `drive_throttle_pct`: overall ratioDrive throttle percentage, default `100.0`
 - `unsafe_drive`: whether teleop should request unsafe drive on startup, default `true`
+
+During teleop, `robot_status_node` logs the requested linear/angular command,
+the converted ratioDrive percentages, and the measured robot feedback speeds.
+
 - `primary_request`: primary laser request name, default `Laser_1Current`
 - `secondary_request`: secondary laser request name, default `Laser_2Current`
 - `primary_topic`: topic for the primary laser, default `/laser`
@@ -108,3 +175,5 @@ The launch file starts `omron_laser_node`, `robot_status_node`, and `map_node`.
 1. Verify the robot accepts the chosen credentials and protocol with `omron_robot_cli`.
 2. Start the ROS 2 launch file.
 3. Inspect `/laser`, `/current_pose`, `/robot_status`, and `/map` using `ros2 topic echo` or RViz.
+
+For deeper operational notes, see the linked documents in the section above.

@@ -28,8 +28,8 @@ def generate_launch_description():
             DeclareLaunchArgument("laser_frame_id", default_value="base_link"),
             DeclareLaunchArgument("map_frame", default_value="map"),
             DeclareLaunchArgument("base_frame", default_value="base_link"),
-            DeclareLaunchArgument("max_linear_speed_mps", default_value="0.5"),
-            DeclareLaunchArgument("max_angular_speed_rad_s", default_value="1.0"),
+            DeclareLaunchArgument("max_linear_speed_mps", default_value="1.2"),
+            DeclareLaunchArgument("max_angular_speed_rad_s", default_value="1.5"),
             DeclareLaunchArgument("drive_throttle_pct", default_value="100.0"),
             DeclareLaunchArgument("unsafe_drive", default_value="true"),
             Node(
